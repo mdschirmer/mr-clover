@@ -19,7 +19,7 @@
 :ORGANIZATION: MGH/HMS
 :CONTACT: mschirmer1@mgh.harvard.edu
 :SINCE: 2025-09-11
-:VERSION: 0.3
+:VERSION: 0.3.1
 """
 #=============================================
 # Metadata
@@ -28,8 +28,8 @@ __author__ = 'mds'
 __contact__ = 'mschirmer1@mgh.harvard.edu'
 __copyright__ = ''
 __license__ = ''
-__date__ = '2025-09-11'
-__version__ = '0.3'
+__date__ = '2025-10-01'
+__version__ = '0.3.1'
 
 #=============================================
 # Import statements
@@ -355,6 +355,49 @@ def validate_icv_mask(icv_mask, brain_mask, debug_mode=False):
         log_success(f"ICV mask validated - only {outside_ratio*100:.3f}% of brain outside ICV")
         return icv_mask, True
 
+def extract_ventricle_mask(synthseg_img, voxel_vol, debug_mode=False):
+    """
+    Extract ventricle mask from SynthSeg segmentation.
+    
+    Ventricle labels in SynthSeg:
+    - 4: Left lateral ventricle
+    - 5: Left inferior lateral ventricle
+    - 14: 3rd ventricle
+    - 15: 4th ventricle
+    - 43: Right lateral ventricle
+    - 44: Right inferior lateral ventricle
+    
+    Parameters
+    ----------
+    synthseg_img : ants.ANTsImage
+        SynthSeg segmentation image
+    voxel_vol : float
+        Volume of a single voxel
+    debug_mode : bool
+        Whether to output debug information
+        
+    Returns
+    -------
+    tuple
+        (ventricle_mask, ventricle_volume) - binary mask and volume in mm³
+    """
+    seg_data = synthseg_img.numpy()
+    
+    # SynthSeg ventricle labels
+    ventricle_labels = [4, 5, 14, 15, 43, 44]
+    
+    # Create binary ventricle mask
+    ventricle_mask = np.zeros_like(seg_data, dtype=np.uint8)
+    for label in ventricle_labels:
+        ventricle_mask[seg_data == label] = 1
+    
+    ventricle_vol = voxel_vol * np.sum(ventricle_mask)
+    
+    log_debug(f"Extracted ventricle mask with {np.sum(ventricle_mask)} voxels", debug_mode)
+    log_success(f"Ventricle volume: {ventricle_vol:.2f} mm³")
+    
+    return ventricle_mask, ventricle_vol
+
 #=============================================
 # Main processing function
 #=============================================
@@ -364,7 +407,7 @@ def main(argv):
     
     The pipeline is modular - components are executed based on requested outputs:
     - Core: bias correction + skull stripping (always runs)
-    - Optional: intensity normalization, GM/WM segmentation, ICV extraction
+    - Optional: intensity normalization, GM/WM segmentation, ICV extraction, ventricle extraction
     
     Parameters
     ----------
@@ -465,9 +508,10 @@ def main(argv):
     if not os.path.isfile(brainfile):
         synthstrip_cmd = ["mri_synthstrip", "-i", temp_bias_file, "-m", brainfile, "-b", "0"]
         
-        if argv.gpu:
+        if not argv.cpu:
+            # Use GPU by default (SynthStrip will fall back to CPU if GPU unavailable)
             synthstrip_cmd.append("-g")
-            log_info("Using GPU acceleration for skull stripping")
+            log_info("Using GPU acceleration for skull stripping (will fall back to CPU if unavailable)")
         
         log_debug(f"Running command: {' '.join(synthstrip_cmd)}", debug_mode)
         
@@ -574,17 +618,26 @@ def main(argv):
         updated_mask = None
     
     #############
-    # STEP 6: ICV extraction (optional)
+    # STEP 6: SynthSeg processing (ICV, ventricles, full segmentation)
     #############
-    if argv.icv is not None:
-        log_info("Step 6: Intracranial volume extraction using SynthSeg")
+    need_synthseg = argv.icv is not None or argv.ventricles is not None or argv.synthseg is not None
+    
+    if need_synthseg:
+        log_info("Step 6: Running SynthSeg for tissue segmentation")
         
-        icvfile = argv.icv
+        # Determine where to save the full SynthSeg output
+        if argv.synthseg is not None:
+            synthseg_file = argv.synthseg
+        else:
+            # Use temporary file if full segmentation not requested
+            synthseg_file = os.path.join(outdir, f"temp_synthseg_{uuid.uuid4()}.nii.gz")
+            temp_files.append(synthseg_file)
         
-        if not os.path.isfile(icvfile):
+        # Run SynthSeg if output doesn't exist
+        if not os.path.isfile(synthseg_file):
             # Build SynthSeg command
             synthseg_cmd = ["mri_synthseg", "--i", temp_bias_file, "--robust", 
-                          "--keepgeom", "--o", icvfile]
+                          "--keepgeom", "--o", synthseg_file]
             
             # Add parcellation if requested
             if argv.parc:
@@ -592,13 +645,14 @@ def main(argv):
                 log_info("Parcellation output enabled")
             
             # GPU or CPU mode
-            if argv.gpu:
-                synthseg_cmd.append("--gpu")
-                log_info("Using GPU acceleration for SynthSeg")
-            else:
+            if argv.cpu:
+                # Force CPU mode
                 n_threads = get_optimal_threads()
                 synthseg_cmd.extend(["--cpu", "--threads", str(n_threads)])
-                log_info(f"Using CPU with {n_threads} threads")
+                log_info(f"Forcing CPU mode with {n_threads} threads")
+            else:
+                # Use GPU by default if available (SynthSeg will fall back to CPU automatically)
+                log_info("Using GPU acceleration for SynthSeg (will fall back to CPU if unavailable)")
             
             log_debug(f"Running command: {' '.join(synthseg_cmd)}", debug_mode)
             
@@ -608,38 +662,69 @@ def main(argv):
             except CalledProcessError as e:
                 log_error(f"SynthSeg failed: {e}")
                 return 1
-            
-            # Load and binarize segmentation for ICV mask
-            try:
-                segfile = ants.image_read(icvfile)
-                icv_mask = ants.utils.threshold_image(segfile, 1e-15)
-                icv_mask.to_filename(icvfile)
-            except Exception as e:
-                log_error(f"Failed to process ICV mask: {e}")
-                return 1
         else:
-            log_info(f"Using existing ICV mask: {icvfile}")
-            icv_mask = ants.image_read(icvfile)
+            log_info(f"Using existing SynthSeg segmentation: {synthseg_file}")
         
-        # Validate ICV mask
-        icv_mask, is_valid = validate_icv_mask(icv_mask, mi_mask, debug_mode)
+        # Load SynthSeg segmentation
+        try:
+            synthseg_img = ants.image_read(synthseg_file)
+        except Exception as e:
+            log_error(f"Failed to load SynthSeg output: {e}")
+            return 1
         
-        if not is_valid:
-            log_warning("ICV validation failed - results may be unreliable")
+        # Extract ICV mask if requested
+        if argv.icv is not None:
+            log_info("Extracting ICV mask from SynthSeg")
+            try:
+                icv_mask = ants.utils.threshold_image(synthseg_img, 1e-15)
+                icv_mask.to_filename(argv.icv)
+                
+                # Validate ICV mask
+                icv_mask, is_valid = validate_icv_mask(icv_mask, mi_mask, debug_mode)
+                
+                if not is_valid:
+                    log_warning("ICV validation failed - results may be unreliable")
+                
+                # Calculate ICV volume
+                icv_vol = voxel_vol * np.sum(icv_mask.numpy() > 0)
+                stats.append(["ICV_volume", "%f" % icv_vol])
+                log_success(f"ICV volume: {icv_vol:.2f} mm³")
+                log_success(f"Saved ICV mask: {argv.icv}")
+                
+                # Constrain GM/WM mask to ICV if both exist
+                if updated_mask is not None:
+                    gmwm_outside = np.sum((updated_mask > 0) & (icv_mask.numpy() == 0))
+                    if gmwm_outside > 0:
+                        log_warning(f"{gmwm_outside} GM/WM voxels outside ICV - constraining to ICV")
+                        updated_mask = np.multiply(updated_mask, icv_mask.numpy())
+                        
+            except Exception as e:
+                log_error(f"Failed to extract ICV mask: {e}")
+                return 1
         
-        # Calculate ICV volume
-        icv_vol = voxel_vol * np.sum(icv_mask.numpy() > 0)
-        stats.append(["ICV_volume", "%f" % icv_vol])
-        log_success(f"ICV volume: {icv_vol:.2f} mm³")
+        # Extract ventricle mask if requested
+        if argv.ventricles is not None:
+            log_info("Extracting ventricle mask from SynthSeg")
+            try:
+                ventricle_mask, ventricle_vol = extract_ventricle_mask(synthseg_img, voxel_vol, debug_mode)
+                
+                # Save ventricle mask
+                ventricle_img = mi_mask.new_image_like(ventricle_mask)
+                ventricle_img.to_filename(argv.ventricles)
+                
+                stats.append(["Ventricle_volume", "%f" % ventricle_vol])
+                log_success(f"Saved ventricle mask: {argv.ventricles}")
+                
+            except Exception as e:
+                log_error(f"Failed to extract ventricle mask: {e}")
+                return 1
         
-        # Constrain GM/WM mask to ICV if both exist
-        if updated_mask is not None:
-            gmwm_outside = np.sum((updated_mask > 0) & (icv_mask.numpy() == 0))
-            if gmwm_outside > 0:
-                log_warning(f"{gmwm_outside} GM/WM voxels outside ICV - constraining to ICV")
-                updated_mask = np.multiply(updated_mask, icv_mask.numpy())
+        # If full SynthSeg output was requested, confirm it's saved
+        if argv.synthseg is not None:
+            log_success(f"Saved full SynthSeg segmentation: {argv.synthseg}")
+            
     else:
-        log_info("Step 6: Skipping ICV extraction (not requested)")
+        log_info("Step 6: Skipping SynthSeg (not requested)")
     
     #############
     # STEP 7: Save final GM/WM mask
@@ -698,7 +783,7 @@ if __name__ == "__main__":
         # Set up command-line parser
         parser = OptionParser(
             description='MR-CLOVER: Modular brain extraction and tissue segmentation pipeline for clinical MRI.',
-            epilog='Example: python mr_clover.py -i T1.nii.gz -o gmwm_mask.nii.gz --brain brain.nii.gz --icv icv.nii.gz',
+            epilog='Example: python mr_clover.py -i T1.nii.gz -o gmwm_mask.nii.gz --brain brain.nii.gz --icv icv.nii.gz --ventricles ventricles.nii.gz',
             version=f'{__version__}'
         )
         
@@ -717,6 +802,12 @@ if __name__ == "__main__":
         parser.add_option('--icv', dest='icv', 
                          help='Output intracranial volume mask (triggers SynthSeg)', 
                          metavar='FILE', default=None)
+        parser.add_option('--ventricles', dest='ventricles', 
+                         help='Output ventricle mask from SynthSeg (triggers SynthSeg)', 
+                         metavar='FILE', default=None)
+        parser.add_option('--synthseg', dest='synthseg', 
+                         help='Output full SynthSeg segmentation (triggers SynthSeg)', 
+                         metavar='FILE', default=None)
         parser.add_option('--norm', dest='norm', 
                          help='Output intensity-normalized brain image', 
                          metavar='FILE', default=None)
@@ -733,8 +824,8 @@ if __name__ == "__main__":
                          metavar='STRING', default=None)
         
         # Processing options
-        parser.add_option('--gpu', dest='gpu', 
-                         help='Enable GPU acceleration (requires NVIDIA GPU with CUDA)', 
+        parser.add_option('--cpu', dest='cpu', 
+                         help='Force CPU-only processing (default: use GPU if available)', 
                          default=False, action="store_true")
         parser.add_option('--parc', dest='parc', 
                          help='Enable parcellation output from SynthSeg', 
@@ -750,7 +841,8 @@ if __name__ == "__main__":
             parser.error("Input file (-i) is required")
         
         # Check if at least one output is specified
-        if not any([options.o, options.brain, options.icv, options.norm, options.bias, options.stats]):
+        if not any([options.o, options.brain, options.icv, options.ventricles, 
+                   options.synthseg, options.norm, options.bias, options.stats]):
             parser.error("At least one output must be specified")
         
         # Run main pipeline
