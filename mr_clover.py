@@ -698,7 +698,8 @@ if __name__ == "__main__":
         # Set up command-line parser
         parser = OptionParser(
             description='MR-CLOVER: Modular brain extraction and tissue segmentation pipeline for clinical MRI.',
-            epilog='Example: python mr_clover.py -i T1.nii.gz -o gmwm_mask.nii.gz --brain brain.nii.gz --icv icv.nii.gz'
+            epilog='Example: python mr_clover.py -i T1.nii.gz -o gmwm_mask.nii.gz --brain brain.nii.gz --icv icv.nii.gz',
+            version=f'{__version__}'
         )
         
         # Required arguments
