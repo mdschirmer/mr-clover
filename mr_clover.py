@@ -19,7 +19,7 @@
 :ORGANIZATION: MGH/HMS
 :CONTACT: mschirmer1@mgh.harvard.edu
 :SINCE: 2025-09-11
-:VERSION: 0.3.1
+:VERSION: 0.4
 """
 #=============================================
 # Metadata
@@ -81,6 +81,11 @@ def log_debug(msg, debug_mode=False):
     """Print debug message in magenta if debug mode is enabled"""
     if debug_mode:
         print(f"{Colors.DEBUG}[DEBUG] {msg}{Colors.ENDC}")
+
+def log_verbose(msg, verbose_mode=False):
+    """Print verbose message if verbose mode is enabled"""
+    if verbose_mode:
+        print(msg)
 
 #=============================================
 # System utility functions
@@ -301,16 +306,16 @@ def rescale(img, mask=None, new_intensity=0.75, mode=None):
     
     return img, norm
 
-def validate_icv_mask(icv_mask, brain_mask, debug_mode=False):
+def validate_icv_mask(icv_mask, gmwm_mask, debug_mode=False):
     """
-    Validate ICV mask quality by checking if brain is properly contained.
+    Validate ICV mask quality by checking if GM/WM tissue is properly contained.
     
     Parameters
     ----------
     icv_mask : ants.ANTsImage
         Intracranial volume mask
-    brain_mask : ants.ANTsImage
-        Brain mask from skull stripping
+    gmwm_mask : ndarray or ants.ANTsImage
+        Grey/white matter mask to validate against
     debug_mode : bool
         Whether to output debug information
         
@@ -320,42 +325,47 @@ def validate_icv_mask(icv_mask, brain_mask, debug_mode=False):
         (icv_mask, is_valid) - mask and validation status
     """
     icv_data = icv_mask.numpy()
-    brain_data = brain_mask.numpy()
     
-    # Calculate how much brain tissue is outside ICV
-    brain_outside_icv = (brain_data > 0) & (icv_data == 0)
-    n_outside = np.sum(brain_outside_icv)
-    brain_volume = np.sum(brain_data > 0)
+    # Handle both ANTsImage and numpy array inputs
+    if isinstance(gmwm_mask, np.ndarray):
+        gmwm_data = gmwm_mask
+    else:
+        gmwm_data = gmwm_mask.numpy()
     
-    if brain_volume == 0:
-        log_error("Brain mask is empty - cannot validate ICV")
-        return icv_mask, False
+    # Calculate how much GM/WM tissue is outside ICV
+    gmwm_outside_icv = (gmwm_data > 0) & (icv_data == 0)
+    n_outside = np.sum(gmwm_outside_icv)
+    gmwm_volume = np.sum(gmwm_data > 0)
     
-    outside_ratio = n_outside / brain_volume
+    if gmwm_volume == 0:
+        log_warning("GM/WM mask is empty - cannot validate ICV")
+        return icv_mask, True
+    
+    outside_ratio = n_outside / gmwm_volume
     
     # Evaluate severity of misalignment
     if outside_ratio > 0.02:  # More than 2% outside
-        log_error(f"{outside_ratio*100:.1f}% of brain mask is outside ICV - ICV segmentation likely failed")
+        log_warning(f"{outside_ratio*100:.1f}% of GM/WM mask is outside ICV - possible ICV segmentation issue")
         
         if debug_mode:
             # Check if these are large connected regions (indicating major dents)
-            labeled_outside = skm.label(brain_outside_icv)
+            labeled_outside = skm.label(gmwm_outside_icv)
             if labeled_outside.max() > 0:
                 cluster_sizes = [np.sum(labeled_outside == i) for i in range(1, labeled_outside.max() + 1)]
                 max_cluster = max(cluster_sizes)
-                log_debug(f"Largest brain cluster outside ICV: {max_cluster} voxels")
+                log_debug(f"Largest GM/WM cluster outside ICV: {max_cluster} voxels")
         
-        return icv_mask, False
+        return icv_mask, True
         
     elif outside_ratio > 0.005:  # 0.5-2% outside
-        log_warning(f"{outside_ratio*100:.1f}% of brain outside ICV - minor edge misalignment")
+        log_warning(f"{outside_ratio*100:.1f}% of GM/WM outside ICV - minor edge misalignment")
         return icv_mask, True
         
     else:
-        log_success(f"ICV mask validated - only {outside_ratio*100:.3f}% of brain outside ICV")
+        log_success(f"ICV mask validated - only {outside_ratio*100:.3f}% of GM/WM outside ICV")
         return icv_mask, True
 
-def extract_ventricle_mask(synthseg_img, voxel_vol, debug_mode=False):
+def extract_ventricle_mask(synthseg_img, voxel_vol, debug_mode=False, verbose_mode=False):
     """
     Extract ventricle mask from SynthSeg segmentation.
     
@@ -375,6 +385,8 @@ def extract_ventricle_mask(synthseg_img, voxel_vol, debug_mode=False):
         Volume of a single voxel
     debug_mode : bool
         Whether to output debug information
+    verbose_mode : bool
+        Whether to output verbose information
         
     Returns
     -------
@@ -394,7 +406,7 @@ def extract_ventricle_mask(synthseg_img, voxel_vol, debug_mode=False):
     ventricle_vol = voxel_vol * np.sum(ventricle_mask)
     
     log_debug(f"Extracted ventricle mask with {np.sum(ventricle_mask)} voxels", debug_mode)
-    log_success(f"Ventricle volume: {ventricle_vol:.2f} mm³")
+    log_verbose(f"Ventricle volume: {ventricle_vol:.2f} mm³", verbose_mode)
     
     return ventricle_mask, ventricle_vol
 
@@ -423,6 +435,8 @@ def main(argv):
     infile = argv.i
     outfile = argv.o
     debug_mode = argv.debug
+    verbose_mode = argv.verbose
+    force_reprocess = argv.force
     stats = []
     temp_files = []  # Track temporary files for cleanup
     
@@ -432,7 +446,9 @@ def main(argv):
     stats.append(["ID", "%s" % argv.sub])
     
     log_info(f"Processing: {argv.sub}")
-    log_debug(f"Debug mode: {'ON' if debug_mode else 'OFF'}", debug_mode)
+    log_verbose(f"Debug mode: {'ON' if debug_mode else 'OFF'}", verbose_mode)
+    log_verbose(f"Verbose mode: ON", verbose_mode)
+    log_verbose(f"Force reprocessing: {'ON' if force_reprocess else 'OFF'}", verbose_mode)
     
     #############
     # Validation checks
@@ -451,14 +467,14 @@ def main(argv):
     try:
         mi = ants.image_read(infile)
         voxel_vol = np.prod(mi.spacing)
-        log_success(f"Loaded image: {mi.shape}, spacing: {mi.spacing}")
+        log_verbose(f"Loaded image: {mi.shape}, spacing: {mi.spacing}", verbose_mode)
     except Exception as e:
         log_error(f"Failed to load input image: {e}")
         return 1
     
     # Check for negative intensities
     if np.any(mi.numpy() < 0):
-        log_warning("Negative intensity values detected - adjusting by adding minimum value")
+        log_verbose("Negative intensity values detected - adjusting by adding minimum value", verbose_mode)
         mi = mi.new_image_like(mi.numpy() + np.abs(np.min(mi.numpy())))
     
     #############
@@ -471,7 +487,7 @@ def main(argv):
     if not os.path.isdir(outdir):
         try:
             os.makedirs(outdir)
-            log_info(f"Created output directory: {outdir}")
+            log_verbose(f"Created output directory: {outdir}", verbose_mode)
         except Exception as e:
             log_error(f"Failed to create output directory: {e}")
             return 1
@@ -479,10 +495,10 @@ def main(argv):
     #############
     # STEP 1: Initial bias field correction
     #############
-    log_info("Step 1: Initial bias field correction")
+    log_verbose("Step 1: Initial bias field correction", verbose_mode)
     try:
         mi = ants.n4_bias_field_correction(mi)
-        log_success("Bias field correction completed")
+        log_verbose("Bias field correction completed", verbose_mode)
     except Exception as e:
         log_error(f"Bias field correction failed: {e}")
         return 1
@@ -495,7 +511,7 @@ def main(argv):
     #############
     # STEP 2: Skull stripping with SynthStrip
     #############
-    log_info("Step 2: Brain extraction using SynthStrip")
+    log_verbose("Step 2: Brain extraction using SynthStrip", verbose_mode)
     
     # Determine brain mask file
     if argv.brain is not None:
@@ -504,32 +520,37 @@ def main(argv):
         brainfile = os.path.join(outdir, f"temp_brain_{uuid.uuid4()}.nii.gz")
         temp_files.append(brainfile)
     
-    # Run SynthStrip if mask doesn't exist
-    if not os.path.isfile(brainfile):
+    # Run SynthStrip if mask doesn't exist or force reprocessing
+    if not os.path.isfile(brainfile) or force_reprocess:
         synthstrip_cmd = ["mri_synthstrip", "-i", temp_bias_file, "-m", brainfile, "-b", "0"]
         
         if not argv.cpu:
             # Use GPU by default (SynthStrip will fall back to CPU if GPU unavailable)
             synthstrip_cmd.append("-g")
-            log_info("Using GPU acceleration for skull stripping (will fall back to CPU if unavailable)")
+            log_verbose("Using GPU acceleration for skull stripping (will fall back to CPU if unavailable)", verbose_mode)
         
         log_debug(f"Running command: {' '.join(synthstrip_cmd)}", debug_mode)
         
         try:
-            call(synthstrip_cmd)
-            log_success("Brain extraction completed")
+            if verbose_mode or debug_mode:
+                call(synthstrip_cmd)
+            else:
+                # Suppress output in non-verbose mode
+                call(synthstrip_cmd, stdout=open(os.devnull, 'wb'), stderr=open(os.devnull, 'wb'))
+            log_verbose("Brain extraction completed", verbose_mode)
+            log_info(f"Created brain mask: {brainfile}")
         except CalledProcessError as e:
             log_error(f"SynthStrip failed: {e}")
             return 1
     else:
-        log_info(f"Using existing brain mask: {brainfile}")
+        log_info(f"Brain mask already exists: {brainfile}")
     
     # Load brain mask
     try:
         mi_mask = ants.image_read(brainfile)
         brain_vol = voxel_vol * np.sum(mi_mask.numpy() > 0)
         stats.append(["Brain_volume", "%f" % brain_vol])
-        log_success(f"Brain volume: {brain_vol:.2f} mm³")
+        log_verbose(f"Brain volume: {brain_vol:.2f} mm³", verbose_mode)
     except Exception as e:
         log_error(f"Failed to load brain mask: {e}")
         return 1
@@ -548,20 +569,23 @@ def main(argv):
     need_second_bias = argv.bias or argv.norm or argv.o
     
     if need_second_bias:
-        log_info("Step 3: Second bias field correction with brain mask")
+        log_verbose("Step 3: Second bias field correction with brain mask", verbose_mode)
         try:
             mi = ants.n4_bias_field_correction(mi, mi_mask)
-            log_success("Masked bias field correction completed")
+            log_verbose("Masked bias field correction completed", verbose_mode)
         except Exception as e:
             log_error(f"Second bias correction failed: {e}")
             return 1
         
         # Save bias corrected image if requested
         if argv.bias:
-            mi.to_filename(argv.bias)
-            log_success(f"Saved bias-corrected image: {argv.bias}")
+            if not os.path.isfile(argv.bias) or force_reprocess:
+                mi.to_filename(argv.bias)
+                log_info(f"Created bias-corrected image: {argv.bias}")
+            else:
+                log_info(f"Bias-corrected image already exists: {argv.bias}")
     else:
-        log_info("Step 3: Skipping second bias correction (not needed)")
+        log_verbose("Step 3: Skipping second bias correction (not needed)", verbose_mode)
     
     #############
     # STEP 4: Intensity normalization (if needed)
@@ -569,30 +593,33 @@ def main(argv):
     need_normalization = argv.norm or argv.o
     
     if need_normalization:
-        log_info("Step 4: Intensity normalization")
+        log_verbose("Step 4: Intensity normalization", verbose_mode)
         try:
             img, intnorm = rescale(mi.numpy(), mask=mi_mask.numpy())
             mi_norm = mi.new_image_like(img)
             stats.append(["NAWM_intensity", "%f" % intnorm])
-            log_success(f"Intensity normalized (WM peak: {intnorm:.2f})")
+            log_verbose(f"Intensity normalized (WM peak: {intnorm:.2f})", verbose_mode)
             
             # Save normalized image if requested
             if argv.norm:
-                mi_norm.to_filename(argv.norm)
-                log_success(f"Saved normalized image: {argv.norm}")
+                if not os.path.isfile(argv.norm) or force_reprocess:
+                    mi_norm.to_filename(argv.norm)
+                    log_info(f"Created normalized image: {argv.norm}")
+                else:
+                    log_info(f"Normalized image already exists: {argv.norm}")
                 
         except Exception as e:
             log_error(f"Intensity normalization failed: {e}")
             return 1
     else:
-        log_info("Step 4: Skipping intensity normalization (not needed)")
+        log_verbose("Step 4: Skipping intensity normalization (not needed)", verbose_mode)
         mi_norm = None
     
     #############
     # STEP 5: GM/WM segmentation (if output requested)
     #############
     if argv.o:
-        log_info("Step 5: Grey/white matter segmentation")
+        log_verbose("Step 5: Grey/white matter segmentation", verbose_mode)
         
         if mi_norm is None:
             log_error("GM/WM segmentation requires intensity normalization")
@@ -608,13 +635,13 @@ def main(argv):
             
             gmwm_vol = voxel_vol * np.sum(updated_mask)
             stats.append(["GMWM_volume", "%f" % gmwm_vol])
-            log_success(f"GM/WM volume: {gmwm_vol:.2f} mm³")
+            log_verbose(f"GM/WM volume: {gmwm_vol:.2f} mm³", verbose_mode)
             
         except Exception as e:
             log_error(f"GM/WM segmentation failed: {e}")
             return 1
     else:
-        log_info("Step 5: Skipping GM/WM segmentation (output not requested)")
+        log_verbose("Step 5: Skipping GM/WM segmentation (output not requested)", verbose_mode)
         updated_mask = None
     
     #############
@@ -623,7 +650,7 @@ def main(argv):
     need_synthseg = argv.icv is not None or argv.ventricles is not None or argv.synthseg is not None
     
     if need_synthseg:
-        log_info("Step 6: Running SynthSeg for tissue segmentation")
+        log_verbose("Step 6: Running SynthSeg for tissue segmentation", verbose_mode)
         
         # Determine where to save the full SynthSeg output
         if argv.synthseg is not None:
@@ -633,8 +660,8 @@ def main(argv):
             synthseg_file = os.path.join(outdir, f"temp_synthseg_{uuid.uuid4()}.nii.gz")
             temp_files.append(synthseg_file)
         
-        # Run SynthSeg if output doesn't exist
-        if not os.path.isfile(synthseg_file):
+        # Run SynthSeg if output doesn't exist or force reprocessing
+        if not os.path.isfile(synthseg_file) or force_reprocess:
             # Build SynthSeg command
             synthseg_cmd = ["mri_synthseg", "--i", temp_bias_file, "--robust", 
                           "--keepgeom", "--o", synthseg_file]
@@ -642,28 +669,37 @@ def main(argv):
             # Add parcellation if requested
             if argv.parc:
                 synthseg_cmd.append("--parc")
-                log_info("Parcellation output enabled")
+                log_verbose("Parcellation output enabled", verbose_mode)
             
             # GPU or CPU mode
             if argv.cpu:
                 # Force CPU mode
                 n_threads = get_optimal_threads()
                 synthseg_cmd.extend(["--cpu", "--threads", str(n_threads)])
-                log_info(f"Forcing CPU mode with {n_threads} threads")
+                log_verbose(f"Forcing CPU mode with {n_threads} threads", verbose_mode)
             else:
                 # Use GPU by default if available (SynthSeg will fall back to CPU automatically)
-                log_info("Using GPU acceleration for SynthSeg (will fall back to CPU if unavailable)")
+                log_verbose("Using GPU acceleration for SynthSeg (will fall back to CPU if unavailable)", verbose_mode)
             
             log_debug(f"Running command: {' '.join(synthseg_cmd)}", debug_mode)
             
             try:
-                call(synthseg_cmd)
-                log_success("SynthSeg segmentation completed")
+                if verbose_mode or debug_mode:
+                    call(synthseg_cmd)
+                else:
+                    # Suppress output in non-verbose mode
+                    call(synthseg_cmd, stdout=open(os.devnull, 'wb'), stderr=open(os.devnull, 'wb'))
+                log_verbose("SynthSeg segmentation completed", verbose_mode)
+                if argv.synthseg is not None:
+                    log_info(f"Created SynthSeg segmentation: {synthseg_file}")
             except CalledProcessError as e:
                 log_error(f"SynthSeg failed: {e}")
                 return 1
         else:
-            log_info(f"Using existing SynthSeg segmentation: {synthseg_file}")
+            if argv.synthseg is not None:
+                log_info(f"SynthSeg segmentation already exists: {synthseg_file}")
+            else:
+                log_verbose(f"Using existing SynthSeg segmentation: {synthseg_file}", verbose_mode)
         
         # Load SynthSeg segmentation
         try:
@@ -674,29 +710,40 @@ def main(argv):
         
         # Extract ICV mask if requested
         if argv.icv is not None:
-            log_info("Extracting ICV mask from SynthSeg")
+            log_verbose("Extracting ICV mask from SynthSeg", verbose_mode)
             try:
-                icv_mask = ants.utils.threshold_image(synthseg_img, 1e-15)
-                icv_mask.to_filename(argv.icv)
+                # Create binary ICV mask (threshold at 1e-15 to include all labeled voxels)
+                icv_mask_data = (synthseg_img.numpy() > 1e-15).astype(np.uint8)
+                icv_mask = synthseg_img.new_image_like(icv_mask_data)
                 
-                # Validate ICV mask
-                icv_mask, is_valid = validate_icv_mask(icv_mask, mi_mask, debug_mode)
-                
-                if not is_valid:
-                    log_warning("ICV validation failed - results may be unreliable")
+                if not os.path.isfile(argv.icv) or force_reprocess:
+                    icv_mask.to_filename(argv.icv)
+                    log_info(f"Created ICV mask: {argv.icv}")
+                else:
+                    log_info(f"ICV mask already exists: {argv.icv}")
                 
                 # Calculate ICV volume
                 icv_vol = voxel_vol * np.sum(icv_mask.numpy() > 0)
                 stats.append(["ICV_volume", "%f" % icv_vol])
-                log_success(f"ICV volume: {icv_vol:.2f} mm³")
-                log_success(f"Saved ICV mask: {argv.icv}")
+                log_verbose(f"ICV volume: {icv_vol:.2f} mm³", verbose_mode)
                 
-                # Constrain GM/WM mask to ICV if both exist
+                # Validate ICV mask against GM/WM if it exists
                 if updated_mask is not None:
+                    icv_mask, is_valid = validate_icv_mask(icv_mask, updated_mask, debug_mode)
+                    
+                    # Constrain GM/WM mask to ICV
                     gmwm_outside = np.sum((updated_mask > 0) & (icv_mask.numpy() == 0))
                     if gmwm_outside > 0:
-                        log_warning(f"{gmwm_outside} GM/WM voxels outside ICV - constraining to ICV")
+                        log_verbose(f"Constraining {gmwm_outside} GM/WM voxels to ICV boundary", verbose_mode)
                         updated_mask = np.multiply(updated_mask, icv_mask.numpy())
+                        # Update GM/WM volume in stats
+                        gmwm_vol = voxel_vol * np.sum(updated_mask)
+                        # Find and update the GMWM_volume stat
+                        for i, stat in enumerate(stats):
+                            if stat[0] == "GMWM_volume":
+                                stats[i] = ["GMWM_volume", "%f" % gmwm_vol]
+                                log_verbose(f"Updated GM/WM volume: {gmwm_vol:.2f} mm³", verbose_mode)
+                                break
                         
             except Exception as e:
                 log_error(f"Failed to extract ICV mask: {e}")
@@ -704,37 +751,40 @@ def main(argv):
         
         # Extract ventricle mask if requested
         if argv.ventricles is not None:
-            log_info("Extracting ventricle mask from SynthSeg")
+            log_verbose("Extracting ventricle mask from SynthSeg", verbose_mode)
             try:
-                ventricle_mask, ventricle_vol = extract_ventricle_mask(synthseg_img, voxel_vol, debug_mode)
+                ventricle_mask, ventricle_vol = extract_ventricle_mask(synthseg_img, voxel_vol, debug_mode, verbose_mode)
                 
                 # Save ventricle mask
-                ventricle_img = mi_mask.new_image_like(ventricle_mask)
-                ventricle_img.to_filename(argv.ventricles)
+                if not os.path.isfile(argv.ventricles) or force_reprocess:
+                    ventricle_img = mi_mask.new_image_like(ventricle_mask)
+                    ventricle_img.to_filename(argv.ventricles)
+                    log_info(f"Created ventricle mask: {argv.ventricles}")
+                else:
+                    log_info(f"Ventricle mask already exists: {argv.ventricles}")
                 
                 stats.append(["Ventricle_volume", "%f" % ventricle_vol])
-                log_success(f"Saved ventricle mask: {argv.ventricles}")
+                log_verbose(f"Ventricle volume: {ventricle_vol:.2f} mm³", verbose_mode)
                 
             except Exception as e:
                 log_error(f"Failed to extract ventricle mask: {e}")
                 return 1
-        
-        # If full SynthSeg output was requested, confirm it's saved
-        if argv.synthseg is not None:
-            log_success(f"Saved full SynthSeg segmentation: {argv.synthseg}")
             
     else:
-        log_info("Step 6: Skipping SynthSeg (not requested)")
+        log_verbose("Step 6: Skipping SynthSeg (not requested)", verbose_mode)
     
     #############
     # STEP 7: Save final GM/WM mask
     #############
     if argv.o and updated_mask is not None:
-        log_info("Step 7: Saving final GM/WM mask")
+        log_verbose("Step 7: Saving final GM/WM mask", verbose_mode)
         try:
-            out = mi_mask.new_image_like(updated_mask)
-            out.to_filename(outfile)
-            log_success(f"Saved GM/WM mask: {outfile}")
+            if not os.path.isfile(argv.o) or force_reprocess:
+                out = mi_mask.new_image_like(updated_mask)
+                out.to_filename(outfile)
+                log_info(f"Created GM/WM mask: {outfile}")
+            else:
+                log_info(f"GM/WM mask already exists: {outfile}")
         except Exception as e:
             log_error(f"Failed to save output mask: {e}")
             return 1
@@ -743,14 +793,14 @@ def main(argv):
     # STEP 8: Save statistics
     #############
     if argv.stats is not None:
-        log_info("Step 8: Saving statistics")
+        log_verbose("Step 8: Saving statistics", verbose_mode)
         try:
             import csv
             stats = np.array(stats).T.tolist()
             with open(argv.stats, 'w', newline='') as fid:
                 writer = csv.writer(fid)
                 writer.writerows(stats)
-            log_success(f"Saved statistics: {argv.stats}")
+            log_verbose(f"Saved statistics: {argv.stats}", verbose_mode)
         except Exception as e:
             log_error(f"Failed to save statistics: {e}")
     
@@ -758,7 +808,7 @@ def main(argv):
     # Cleanup temporary files
     #############
     if not debug_mode:
-        log_info("Cleaning up temporary files")
+        log_verbose("Cleaning up temporary files", verbose_mode)
         for temp_file in temp_files:
             if os.path.isfile(temp_file):
                 try:
@@ -772,7 +822,7 @@ def main(argv):
             if os.path.isfile(temp_file):
                 log_debug(f"Kept temporary file: {temp_file}", debug_mode)
     
-    log_success("Pipeline completed successfully!")
+    log_verbose("Pipeline completed successfully!", verbose_mode)
     return 0
 
 #=============================================
@@ -832,6 +882,12 @@ if __name__ == "__main__":
                          default=False, action="store_true")
         parser.add_option('--debug', dest='debug', 
                          help='Enable debug mode (keeps temporary files, verbose output)', 
+                         default=False, action="store_true")
+        parser.add_option('--verbose', dest='verbose', 
+                         help='Enable verbose output (show all processing steps)', 
+                         default=False, action="store_true")
+        parser.add_option('--force', dest='force', 
+                         help='Force reprocessing of all outputs (ignore existing files)', 
                          default=False, action="store_true")
         
         (options, args) = parser.parse_args()

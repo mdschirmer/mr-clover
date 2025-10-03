@@ -122,12 +122,6 @@ The pipeline intelligently determines which processing steps to run based on you
 
 MR-CLOVER is an open-source project developed by MDS at Massachusetts General Hospital and Harvard Medical School. Contributions are welcome, particularly in improving the algorithms for brain tissue segmentation and volume calculation.
 
-### Planned Improvements (v0.4)
-- Support for non-CSF-dark modalities (T2, etc.)
-- Use SynthSeg tissue masks for robust intensity normalization
-- GMM-based tissue segmentation with seed points from SynthSeg labels
-- Enhanced tissue classification for all MRI sequences
-
 ## Contact
 
 For issues, suggestions, or contributions, please contact the lead developer at mschirmer1@mgh.harvard.edu.
