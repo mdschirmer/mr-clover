@@ -29,7 +29,7 @@ __contact__ = 'mschirmer1@mgh.harvard.edu'
 __copyright__ = ''
 __license__ = ''
 __date__ = '2025-10-01'
-__version__ = '0.3.1'
+__version__ = '0.4.1'
 
 #=============================================
 # Import statements
@@ -883,8 +883,8 @@ if __name__ == "__main__":
         parser.add_option('--debug', dest='debug', 
                          help='Enable debug mode (keeps temporary files, verbose output)', 
                          default=False, action="store_true")
-        parser.add_option('--verbose', dest='verbose', 
-                         help='Enable verbose output (show all processing steps)', 
+        parser.add_option('-v', '--verbose', dest='verbose',
+                         help='Enable verbose output (show all processing steps)',
                          default=False, action="store_true")
         parser.add_option('--force', dest='force', 
                          help='Force reprocessing of all outputs (ignore existing files)', 
