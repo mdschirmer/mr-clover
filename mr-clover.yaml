@@ -1,0 +1,18 @@
+# Conda environment file for the mr-clover project
+# To create the environment, run the following command:
+# conda env create -f mr-clover.yaml
+name: mr-clover
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - numpy==1.24.3
+  - scikit-learn==1.3.2
+  - scipy=1.10.1
+  - scikit-image=0.20.0
+  - pip
+  - pip:
+    - antspyx==0.4.2
+
+# Followed by 
+# conda install conda-forge::ants
