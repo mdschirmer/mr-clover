@@ -1,12 +1,11 @@
 # Core scientific computing
 numpy==1.24.3
 scipy==1.11.4
-scikit-image==0.22.0
 
 # ANTs for medical image processing
 antspyx==0.4.2
 
 # Note: The following tools must be installed separately:
-# - FreeSurfer (for mri_synthstrip and mri_synthseg commands)
+# - FreeSurfer 7.3 or newer (for the mri_synthseg command)
 #   See: https://surfer.nmr.mgh.harvard.edu/fswiki/DownloadAndInstall
-# - These are command-line tools, not Python packages
+# - This is a command-line tool, not a Python package
