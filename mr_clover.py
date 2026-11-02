@@ -39,7 +39,7 @@ import os
 from optparse import OptionParser
 import re
 import multiprocessing
-from subprocess import call, CalledProcessError
+from subprocess import call, check_call, CalledProcessError
 
 import numpy as np
 import scipy.ndimage as sn
@@ -533,10 +533,10 @@ def main(argv):
         
         try:
             if verbose_mode or debug_mode:
-                call(synthstrip_cmd)
+                check_call(synthstrip_cmd)
             else:
                 # Suppress output in non-verbose mode
-                call(synthstrip_cmd, stdout=open(os.devnull, 'wb'), stderr=open(os.devnull, 'wb'))
+                check_call(synthstrip_cmd, stdout=open(os.devnull, 'wb'), stderr=open(os.devnull, 'wb'))
             log_verbose("Brain extraction completed", verbose_mode)
             log_info(f"Created brain mask: {brainfile}")
         except CalledProcessError as e:
@@ -685,10 +685,10 @@ def main(argv):
             
             try:
                 if verbose_mode or debug_mode:
-                    call(synthseg_cmd)
+                    check_call(synthseg_cmd)
                 else:
                     # Suppress output in non-verbose mode
-                    call(synthseg_cmd, stdout=open(os.devnull, 'wb'), stderr=open(os.devnull, 'wb'))
+                    check_call(synthseg_cmd, stdout=open(os.devnull, 'wb'), stderr=open(os.devnull, 'wb'))
                 log_verbose("SynthSeg segmentation completed", verbose_mode)
                 if argv.synthseg is not None:
                     log_info(f"Created SynthSeg segmentation: {synthseg_file}")
